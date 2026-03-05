@@ -1,0 +1,1012 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <meta name="theme-color" content="#000000"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black"/>
+  <title>Color Path</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box;}
+    html,body{height:100%;background:#000;overflow:hidden;}
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- React + Babel (no build step needed) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.3/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useState, useRef, useEffect, useCallback } = React;
+
+/* ══════════════════════════════════════════════════════════════
+   COLOR PATH  ·  Girl Punk Graph Puzzle
+
+   GENERATION
+   ───────────
+   Sequential BFS per colour pair:
+   1. Pick 2 free nodes (not occupied, min distance apart)
+   2. BFS shortest path avoiding all occupied nodes/edges
+   3. Mark entire path (nodes + edges) as occupied
+   4. If BFS fails → repick endpoints (up to 100 attempts)
+   5. If pair still fails → restart whole level (up to 30 tries)
+
+   PLAYER INTERACTION
+   ───────────────────
+   • Drag along graph edges node-by-node
+   • Each node/edge entered becomes occupied by that colour
+   • No other colour can enter an occupied node or edge
+   • Backtrack by dragging back — releases nodes/edges
+   • Lift finger → cancels incomplete line, releases all
+   • Complete = reach matching endpoint → line locks permanently
+
+   SHAPES (rotate at each 10% milestone)
+   ───────────────────────────────────────
+   donut · circle · grid · heart · star · cross · diamond-large
+
+   SCORING
+   ────────
+   • Level worth = pairs × 10 × multiplier (counted at completion)
+   • Hard reset: −40% level worth from score, −40% multiplier
+   • Multiplier +1% per pair, never below 1.0×
+   • 10% milestone: +1 Safe Clear (max 5), shape rotates next level
+   • 50% milestone: +1 Safe Reset (max 2)
+══════════════════════════════════════════════════════════════ */
+
+// ── PALETTE ────────────────────────────────────────────────────
+const PAL = {
+  rose:     { fill:"#FF3D7F", dark:"#0d0005", dim:"#1a000a" },
+  mint:     { fill:"#00FFEA", dark:"#001210", dim:"#001e1c" },
+  lemon:    { fill:"#FFE500", dark:"#110e00", dim:"#1e1900" },
+  sky:      { fill:"#3399FF", dark:"#000d1a", dim:"#001428" },
+  peach:    { fill:"#FF7733", dark:"#110500", dim:"#1e0d00" },
+  lavender: { fill:"#CC44FF", dark:"#090015", dim:"#100022" },
+  lime:     { fill:"#88FF00", dark:"#061000", dim:"#0d1f00" },
+  cyan:     { fill:"#00CCFF", dark:"#001518", dim:"#002028" },
+};
+// Exactly 8 distinct colors \u2014 numPairs is capped at 8 so colors never repeat
+const COLOR_KEYS = Object.keys(PAL);
+
+// \u2500\u2500 RNG \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+function makeRng(seed) {
+  let s = (seed ^ 0x9e3779b9) >>> 0;
+  return () => { s^=s<<13; s^=s>>>17; s^=s<<5; return (s>>>0)/4294967296; };
+}
+
+// \u2500\u2500 GRAPH BUILDERS \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+function buildAdj(nodes, edges) {
+  const adj = {};
+  nodes.forEach(n => adj[n.id] = []);
+  edges.forEach(e => {
+    adj[e.a].push({ node:e.b, edge:e.id });
+    adj[e.b].push({ node:e.a, edge:e.id });
+  });
+  return adj;
+}
+
+// Remove edges shorter than minDist \u2014 prevents untraceably tiny cells
+function pruneShortEdges(nodes, edges, minDist=0.042) {
+  const m = {};
+  nodes.forEach(n => m[n.id] = n);
+  return edges.filter(e => {
+    const a=m[e.a], b=m[e.b];
+    return !a||!b || Math.hypot(a.x-b.x, a.y-b.y) >= minDist;
+  });
+}
+
+// ── POLAR RING SHAPES ─────────────────────────────────────────
+// outerR=0.48 fills canvas edge-to-edge.
+// innerR chosen large enough that innermost ring nodes always have
+// ≥2 ring-neighbours — no isolated center nodes possible.
+
+function buildDonut(rings=5, spokes=24) {
+  const nodes=[], edges=[];
+  const cx=0.5, cy=0.5, minR=0.18, maxR=0.48;
+  for (let r=0; r<rings; r++) for (let s=0; s<spokes; s++) {
+    const radius = minR+(maxR-minR)*(r/(rings-1));
+    const angle  = (s/spokes)*Math.PI*2;
+    nodes.push({ id:r*spokes+s, x:cx+Math.cos(angle)*radius, y:cy+Math.sin(angle)*radius, ring:r, spoke:s, arcCx:cx, arcCy:cy });
+  }
+  for (let r=0; r<rings; r++) for (let s=0; s<spokes; s++) {
+    const a=r*spokes+s, b=r*spokes+(s+1)%spokes;
+    edges.push({ id:`${a}-${b}`, a, b, type:'arc', ring:r });
+  }
+  for (let r=0; r<rings-1; r++) for (let s=0; s<spokes; s++) {
+    const a=r*spokes+s, b=(r+1)*spokes+s;
+    edges.push({ id:`${a}-${b}`, a, b, type:'spoke' });
+  }
+  const p = pruneShortEdges(nodes, edges);
+  return { nodes, edges:p, adj:buildAdj(nodes,p), shape:'donut' };
+}
+
+function buildCircle(rings=5, spokes=20) {
+  const nodes=[], edges=[];
+  const cx=0.5, cy=0.5, minR=0.16, maxR=0.48;
+  for (let r=0; r<rings; r++) for (let s=0; s<spokes; s++) {
+    const radius = minR+(maxR-minR)*(r/(rings-1));
+    const angle  = (s/spokes)*Math.PI*2;
+    nodes.push({ id:r*spokes+s, x:cx+Math.cos(angle)*radius, y:cy+Math.sin(angle)*radius, ring:r, spoke:s, arcCx:cx, arcCy:cy });
+  }
+  for (let r=0; r<rings; r++) for (let s=0; s<spokes; s++) {
+    const a=r*spokes+s, b=r*spokes+(s+1)%spokes;
+    edges.push({ id:`${a}-${b}`, a, b, type:'arc', ring:r });
+  }
+  for (let r=0; r<rings-1; r++) for (let s=0; s<spokes; s++) {
+    const a=r*spokes+s, b=(r+1)*spokes+s;
+    edges.push({ id:`${a}-${b}`, a, b, type:'spoke' });
+  }
+  const p = pruneShortEdges(nodes, edges);
+  return { nodes, edges:p, adj:buildAdj(nodes,p), shape:'circle' };
+}
+
+// ── POLYGON RING SHAPES ────────────────────────────────────────
+function buildPolygon(sides, rings, spokesPerSide, outerR, innerR, shape) {
+  const nodes=[], edges=[];
+  const cx=0.5, cy=0.5, S=sides*spokesPerSide;
+  function polyPt(t, scale) {
+    const angle  = t*Math.PI*2;
+    const seg    = Math.PI*2/sides;
+    const sector = Math.floor(angle/seg);
+    const tis    = angle - sector*seg - seg/2;
+    const polyR  = Math.cos(Math.PI/sides)/Math.cos(tis);
+    return { x:cx+Math.cos(angle)*polyR*scale, y:cy+Math.sin(angle)*polyR*scale };
+  }
+  for (let r=0; r<rings; r++) {
+    const scale = innerR+(outerR-innerR)*(r/(rings-1));
+    for (let s=0; s<S; s++) {
+      const pt = polyPt(s/S, scale);
+      nodes.push({ id:r*S+s, x:pt.x, y:pt.y, ring:r, spoke:s, arcCx:cx, arcCy:cy });
+    }
+  }
+  for (let r=0; r<rings; r++) for (let s=0; s<S; s++) {
+    const a=r*S+s, b=r*S+(s+1)%S;
+    edges.push({ id:`${a}-${b}`, a, b, type:'poly', ring:r });
+  }
+  for (let r=0; r<rings-1; r++) for (let s=0; s<S; s++) {
+    const a=r*S+s, b=(r+1)*S+s;
+    edges.push({ id:`${a}-${b}`, a, b, type:'spoke' });
+  }
+  const p = pruneShortEdges(nodes, edges, 0.038);
+  return { nodes, edges:p, adj:buildAdj(nodes,p), shape };
+}
+
+// outerR=0.48. innerR large enough to avoid any isolated center node.
+function buildPentFull()  { return buildPolygon(5, 5, 3, 0.48, 0.18, 'pentagon');  }
+function buildPentRing()  { return buildPolygon(5, 4, 3, 0.48, 0.26, 'pentRing');  }
+function buildHexFull()   { return buildPolygon(6, 5, 3, 0.48, 0.16, 'hex');       }
+function buildHexRing()   { return buildPolygon(6, 4, 3, 0.48, 0.24, 'hexRing');   }
+function buildOctFull()   { return buildPolygon(8, 5, 2, 0.48, 0.18, 'octagon');   }
+function buildOctRing()   { return buildPolygon(8, 4, 2, 0.48, 0.26, 'octRing');   }
+
+// ── GRID SHAPE ─────────────────────────────────────────────────
+function buildGrid(cols=12, rows=12) {
+  const nodes=[], edges=[];
+  const pad=0.04, w=1-pad*2;
+  let id=0; const idMap={};
+  for (let r=0; r<rows; r++) for (let c=0; c<cols; c++) {
+    idMap[`${r},${c}`] = id;
+    nodes.push({ id:id++, x:pad+c*w/(cols-1), y:pad+r*w/(rows-1), row:r, col:c });
+  }
+  const addE=(r1,c1,r2,c2)=>{
+    const a=idMap[`${r1},${c1}`], b=idMap[`${r2},${c2}`];
+    if (a==null||b==null) return;
+    const eid=`${Math.min(a,b)}-${Math.max(a,b)}`;
+    if (!edges.find(e=>e.id===eid)) edges.push({ id:eid, a, b, type:'grid' });
+  };
+  for (let r=0; r<rows; r++) for (let c=0; c<cols; c++) {
+    if (c<cols-1) addE(r,c,r,c+1);
+    if (r<rows-1) addE(r,c,r+1,c);
+  }
+  return { nodes, edges, adj:buildAdj(nodes,edges), shape:'grid' };
+}
+
+// ── SHAPE CATALOGUE ────────────────────────────────────────────
+const SHAPES = [
+  { key:'donut',    build:()=>buildDonut(),     label:'DONUT'    },
+  { key:'circle',   build:()=>buildCircle(),    label:'CIRCLE'   },
+  { key:'grid',     build:()=>buildGrid(),      label:'GRID'     },
+  { key:'hex',      build:()=>buildHexFull(),   label:'HEXAGON'  },
+  { key:'hexRing',  build:()=>buildHexRing(),   label:'HEX RING' },
+  { key:'oct',      build:()=>buildOctFull(),   label:'OCTAGON'  },
+  { key:'octRing',  build:()=>buildOctRing(),   label:'OCT RING' },
+  { key:'pent',     build:()=>buildPentFull(),  label:'PENTAGON' },
+  { key:'pentRing', build:()=>buildPentRing(),  label:'PENT RING'},
+];
+// ── SHAPE PICKER ───────────────────────────────────────────────
+// Never picks the same shape twice in a row.
+function pickShape(currentIdx) {
+  const n = SHAPES.length;
+  if (n <= 1) return 0;
+  let next = Math.floor(Math.random() * (n - 1));
+  if (next >= currentIdx) next++;
+  return next;
+}
+
+// ── BFS SHORTEST PATH ──────────────────────────────────────────
+// Finds shortest path from start to end, avoiding occupied nodes/edges.
+// Endpoints themselves are allowed even if occupied (they are the pair's own nodes).
+function bfsPath(startId, endId, adj, occNodes, occEdges) {
+  if (occNodes.has(startId) || occNodes.has(endId)) return null;
+  const visited = new Set([startId]);
+  const queue   = [{ id:startId, path:[startId] }];
+  while (queue.length) {
+    const { id, path } = queue.shift();
+    if (id === endId) return path;
+    for (const { node, edge } of (adj[id]||[])) {
+      if (visited.has(node)) continue;
+      if (occEdges.has(edge)) continue;
+      if (occNodes.has(node) && node !== endId) continue;
+      visited.add(node);
+      queue.push({ id:node, path:[...path, node] });
+    }
+  }
+  return null;
+}
+
+// ── LEVEL GENERATION ───────────────────────────────────────────
+// Strategy per pair (sequential):
+//   1. Pick A biased far from all existing endpoints.
+//   2. Pick B farthest from A (top 25%) that isn't an existing endpoint.
+//   3. BFS A→B avoiding reserved nodes (interior nodes of prior paths)
+//      AND all existing endpoints.
+//   4. If a path is found, reserve its interior nodes so future pairs
+//      must route around it. Endpoints A and B are NOT reserved as
+//      blocked — they're dots the player must connect.
+//   5. If no path found after PER_PAIR_TRIES, reduce pair count by 1.
+//
+// Player rules mirror this: locked paths block movement; other colors'
+// dots block passage; only your own two dots are your start/end.
+function generateLevel(graph, numPairs, seed) {
+  const { nodes, adj } = graph;
+  const nodeMap = {};
+  nodes.forEach(n => nodeMap[n.id] = n);
+  const ids = nodes.map(n => n.id);
+
+  const MIN_END_DIST   = 0.22;  // min Euclidean distance between a pair's two dots
+  const MIN_SEP        = 0.12;  // min distance between any two endpoints
+  const PER_PAIR_TRIES = 150;
+  const RESTARTS       = 25;
+
+  for (let restart = 0; restart < RESTARTS; restart++) {
+    const rng = makeRng(seed + restart * 6271);
+
+    // reserved: interior nodes of committed paths (player must route around them)
+    // endpoints: the actual dots placed so far (block A/B selection and BFS)
+    const reserved  = new Set();  // interior path nodes
+    const endpoints = new Set();  // all A and B dots placed
+    const pairs     = [];
+    let   ok        = true;
+
+    for (let i = 0; i < numPairs; i++) {
+      let placed = false;
+
+      for (let att = 0; att < PER_PAIR_TRIES; att++) {
+        // ── Pick A: not reserved or an endpoint ────────────────
+        const freeA = ids.filter(id => !reserved.has(id) && !endpoints.has(id));
+        if (freeA.length < 4) break;
+
+        let a;
+        if (endpoints.size === 0) {
+          a = freeA[Math.floor(rng() * freeA.length)];
+        } else {
+          const scored = freeA.map(id => {
+            const n = nodeMap[id];
+            const minD = Math.min(...[...endpoints].map(eid =>
+              Math.hypot(n.x - nodeMap[eid].x, n.y - nodeMap[eid].y)
+            ));
+            return { id, minD };
+          }).sort((x, y) => y.minD - x.minD);
+          const topA = Math.max(1, Math.ceil(scored.length * 0.30));
+          a = scored[Math.floor(rng() * topA)].id;
+        }
+        const na = nodeMap[a];
+        // Reject if too close to any existing endpoint
+        if ([...endpoints].some(eid =>
+          Math.hypot(na.x - nodeMap[eid].x, na.y - nodeMap[eid].y) < MIN_SEP
+        )) continue;
+
+        // ── Pick B: not reserved/endpoint, far from A ──────────
+        const candB = ids.filter(id => {
+          if (id === a || reserved.has(id) || endpoints.has(id)) return false;
+          const nb = nodeMap[id];
+          if (Math.hypot(na.x - nb.x, na.y - nb.y) < MIN_END_DIST) return false;
+          return ![...endpoints].some(eid =>
+            Math.hypot(nb.x - nodeMap[eid].x, nb.y - nodeMap[eid].y) < MIN_SEP
+          );
+        });
+        if (candB.length === 0) continue;
+
+        candB.sort((x, y) => {
+          const nx = nodeMap[x], ny = nodeMap[y];
+          return Math.hypot(ny.x - na.x, ny.y - na.y)
+               - Math.hypot(nx.x - na.x, nx.y - na.y);
+        });
+        const topB = Math.max(1, Math.ceil(candB.length * 0.25));
+        const b = candB[Math.floor(rng() * topB)];
+
+        // ── BFS: A→B avoiding reserved interior nodes AND all endpoints ──
+        // Endpoints act as walls in BFS so paths don't cut through other dots.
+        const bfsWalls = new Set([...reserved, ...endpoints]);
+        const path = bfsPath(a, b, adj, bfsWalls, new Set());
+        if (!path || path.length < 2) continue;
+
+        // ── Commit: reserve interior nodes, register endpoints ──
+        path.slice(1, -1).forEach(nid => reserved.add(nid));
+        endpoints.add(a);
+        endpoints.add(b);
+        pairs.push({ a, b, color: COLOR_KEYS[i] });
+        placed = true;
+        break;
+      }
+
+      if (!placed) { ok = false; break; }
+    }
+
+    if (ok && pairs.length === numPairs) {
+      // Final validation: every pair can still reach its partner
+      // when all OTHER pairs' endpoints are walls (mirrors player experience)
+      const allEnds = new Set(pairs.flatMap(p => [p.a, p.b]));
+      const valid = pairs.every(p => {
+        const walls = new Set([...allEnds].filter(id => id !== p.a && id !== p.b));
+        return !!bfsPath(p.a, p.b, adj, walls, new Set());
+      });
+      if (valid) return { pairs, graph };
+    }
+  }
+  return null;
+}
+
+const MIN_PAIRS = 3;
+function generateWithRetry(graph, pairsBase, seed) {
+  for (let target = pairsBase; target >= MIN_PAIRS; target--) {
+    for (let t = 0; t < 6; t++) {
+      const r = generateLevel(graph, target, seed + t * 3571);
+      if (r) return { ...r, pairsBase };
+    }
+  }
+  for (let t = 0; t < 10; t++) {
+    const r = generateLevel(graph, 2, seed + t * 999);
+    if (r) return { ...r, pairsBase };
+  }
+  return null;
+}
+
+// ── COORDINATE HELPERS ─────────────────────────────────────────
+function nToC([x,y], size) {
+  const p=size*0.05, w=size-p*2;
+  return { x:p+x*w, y:p+y*w };
+}
+
+// ── EDGE DRAWING ───────────────────────────────────────────────
+function strokeEdge(ctx, na, nb, edgeType, size, color, alpha, lw) {
+  const pa = nToC([na.x,na.y], size);
+  const pb = nToC([nb.x,nb.y], size);
+  ctx.save();
+  ctx.globalAlpha = alpha ?? 1;
+  ctx.lineWidth   = lw ?? 1.2;
+  ctx.lineCap     = "round";
+
+  if (color) {
+    const c = PAL[color];
+    ctx.shadowColor = c.fill; ctx.shadowBlur = 10;
+    ctx.strokeStyle = c.fill;
+  } else {
+    ctx.strokeStyle = "rgba(255,140,100,0.15)";
+    ctx.shadowBlur  = 0;
+  }
+
+  if (edgeType==='arc' && na.ring===nb.ring && na.ring!==-1) {
+    const cx2=size*0.5, cy2=size*0.5;
+    const R  = Math.hypot(pa.x-cx2, pa.y-cy2);
+    const a1 = Math.atan2(pa.y-cy2, pa.x-cx2);
+    const a2 = Math.atan2(pb.y-cy2, pb.x-cx2);
+    let diff = a2-a1;
+    if (diff >  Math.PI) diff -= Math.PI*2;
+    if (diff < -Math.PI) diff += Math.PI*2;
+    ctx.beginPath();
+    ctx.arc(cx2, cy2, R, a1, a1+diff, diff<0);
+  } else {
+    ctx.beginPath();
+    ctx.moveTo(pa.x, pa.y);
+    ctx.lineTo(pb.x, pb.y);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ── SPHERE ─────────────────────────────────────────────────────
+function drawSphere(ctx, p, color, isDone, dimmed, r) {
+  const c = PAL[color];
+  ctx.save();
+  if (dimmed) {
+    ctx.beginPath(); ctx.arc(p.x,p.y,r,0,Math.PI*2);
+    ctx.fillStyle=c.dim; ctx.fill(); ctx.restore(); return;
+  }
+  // Halo
+  const halo=ctx.createRadialGradient(p.x,p.y,r*.4,p.x,p.y,r*2.8);
+  halo.addColorStop(0,c.fill+(isDone?"55":"1a")); halo.addColorStop(1,"transparent");
+  ctx.beginPath(); ctx.arc(p.x,p.y,r*2.8,0,Math.PI*2); ctx.fillStyle=halo; ctx.fill();
+  // Body
+  ctx.shadowColor=c.fill; ctx.shadowBlur=isDone?26:12;
+  const sg=ctx.createRadialGradient(p.x-r*.3,p.y-r*.33,r*.05,p.x,p.y,r);
+  sg.addColorStop(0,"rgba(255,255,255,.95)"); sg.addColorStop(0.14,c.fill+"ee");
+  sg.addColorStop(0.65,c.fill); sg.addColorStop(1,c.dark);
+  ctx.beginPath(); ctx.arc(p.x,p.y,r,0,Math.PI*2); ctx.fillStyle=sg; ctx.fill();
+  // Rim
+  ctx.shadowBlur=0;
+  ctx.strokeStyle=isDone?"rgba(255,255,255,.8)":c.fill+"66";
+  ctx.lineWidth=isDone?2.2:1; ctx.globalAlpha=isDone?1:.65; ctx.stroke();
+  // Specular
+  ctx.globalAlpha=.76;
+  ctx.beginPath(); ctx.arc(p.x-r*.28,p.y-r*.3,r*.22,0,Math.PI*2);
+  ctx.fillStyle="rgba(255,255,255,.88)"; ctx.fill();
+  if (isDone) {
+    ctx.globalAlpha=1; ctx.strokeStyle="#fff";
+    ctx.lineWidth=r*.2; ctx.lineCap="round"; ctx.lineJoin="round";
+    ctx.beginPath();
+    ctx.moveTo(p.x-r*.27,p.y); ctx.lineTo(p.x-.04*r,p.y+r*.25); ctx.lineTo(p.x+r*.3,p.y-.21*r);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// ── SAVE ───────────────────────────────────────────────────────
+const SK = "cp_v1";
+const blankSave = () => ({
+  highScore:0, levelsCompleted:0, totalPairs:0, totalMistakes:0,
+  score:0, multiplier:1.0, safeClearCharges:3, safeResetCharges:1,
+  pairsBase:5, shapeIdx:Math.floor(Math.random()*SHAPES.length),
+});
+const rdSave = () => { try { const d=JSON.parse(localStorage.getItem(SK)); return d?.levelsCompleted!=null?d:blankSave(); } catch { return blankSave(); } };
+const wrSave = d => { try { localStorage.setItem(SK,JSON.stringify(d)); } catch {} };
+
+// ── CSS ────────────────────────────────────────────────────────
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Rajdhani:wght@400;600;700&display=swap');
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;margin:0;padding:0;}
+body{background:#000;}
+.TT{font-family:'Bebas Neue',sans-serif;}
+.RJ{font-family:'Rajdhani',sans-serif;}
+@keyframes shake{0%,100%{transform:translateX(0)}15%{transform:translateX(-9px)}35%{transform:translateX(8px)}55%{transform:translateX(-5px)}75%{transform:translateX(5px)}90%{transform:translateX(-2px)}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+@keyframes fadeUpOut{0%{opacity:0;transform:translateY(12px)}15%{opacity:1;transform:translateY(0)}70%{opacity:1;transform:translateY(0)}100%{opacity:0;transform:translateY(-10px)}}
+@keyframes pulse{0%,100%{opacity:.2}50%{opacity:.85}}
+.shake{animation:shake .45s ease;}
+.btn{display:inline-flex;align-items:center;justify-content:center;border:none;cursor:pointer;font-family:'Bebas Neue',sans-serif;letter-spacing:2px;border-radius:3px;transition:all .13s;outline:none;}
+.btn:active{transform:scale(.92);}
+.btn-pink{background:#FF8C69;color:#000;padding:11px 28px;font-size:15px;}
+.btn-ghost{background:transparent;border:1px solid rgba(255,140,100,.22);color:rgba(255,140,100,.5);padding:7px 14px;font-size:10px;}
+.btn-ghost:active{border-color:#FF8C69;color:#FF8C69;}
+.cbtn{background:#060606;border:1px solid #181818;color:#2a2a2a;padding:6px 12px;font-size:10px;border-radius:3px;cursor:pointer;font-family:'Bebas Neue',sans-serif;letter-spacing:2px;transition:all .13s;outline:none;}
+.cbtn.on{border-color:rgba(255,140,100,.32);color:#FF8C69;}
+.cbtn.pu.on{border-color:rgba(187,134,252,.32);color:#BB86FC;}
+.cbtn.re{border-color:rgba(255,50,50,.18);color:rgba(255,70,70,.38);}
+.cbtn:active{transform:scale(.92);}
+`;
+
+// ══════════════════════════════════════════════════════════════
+function App() {
+  const [gs,      setGs]      = useState(rdSave);
+  const [screen,  setScreen]  = useState("menu");
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [puzzle,  setPuzzle]  = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  // Player drawing state
+  // playerPaths: color → { nodeSet: Set<id>, edgeSet: Set<id>, locked: bool }
+  const [playerPaths, setPlayerPaths] = useState({});
+  const [completed,   setCompleted]   = useState(new Set());
+  // active: { color, nodeTrail:[id], edgeTrail:[id], startId, targetId }
+  const [active,    setActive]    = useState(null);
+  const [shaking,   setShaking]   = useState(false);
+  const [milestone, setMilestone] = useState(null);
+  const [showNext,  setShowNext]  = useState(false);
+  const [levelBonus,setLevelBonus]= useState({pts:0,charge:[]});
+  const [dimming,   setDimming]   = useState(false);
+
+  const canvasRef = useRef(null);
+  const justCompletedRef = useRef(false);
+  const showNextRef = useRef(false);
+  const [cSize, setCSize] = useState(360);
+
+  // Stable refs for use in event handlers
+  const gsRef     = useRef(gs);     gsRef.current     = gs;
+  const pzRef     = useRef(null);
+  const activeRef = useRef(null);   activeRef.current = active;
+  const ppRef     = useRef({});     ppRef.current     = playerPaths;
+  const compRef   = useRef(new Set()); compRef.current = completed;
+  showNextRef.current = showNext;
+
+  useEffect(()=>wrSave(gs),[gs]);
+
+  useEffect(()=>{
+    const upd=()=>setCSize(Math.max(300,Math.min(window.innerWidth-24,window.innerHeight-210,490)));
+    upd(); window.addEventListener("resize",upd); return()=>window.removeEventListener("resize",upd);
+  },[]);
+
+  // ── START LEVEL ──────────────────────────────────────────────
+  function startLevel(shapeIdx, numPairs, seed) {
+    setLoading(true); setPuzzle(null);
+    setPlayerPaths({}); ppRef.current={};
+    setCompleted(new Set()); compRef.current=new Set();
+    setActive(null); activeRef.current=null;
+    setShaking(false); setMilestone(null); setShowNext(false); setDimming(false); setLevelBonus({pts:0,charge:[]});
+
+    setTimeout(()=>{
+      const shape = SHAPES[shapeIdx % SHAPES.length];
+      const graph = shape.build();
+      const pz    = generateWithRetry(graph, numPairs, seed??Date.now()%99999);
+      pzRef.current = pz;
+      setPuzzle(pz);
+      setLoading(false);
+    }, 40);
+  }
+
+  function beginPlay() {
+    const g=gsRef.current;
+    startLevel(g.shapeIdx, g.pairsBase, Date.now()%99999);
+    setScreen("game");
+  }
+  function nextLevel() { const g=gsRef.current; startLevel(g.shapeIdx,g.pairsBase,Date.now()%99999); setShowNext(false); }
+  function safeClear() {
+    if (gsRef.current.safeClearCharges<=0||showNext) return;
+    setGs(p=>({...p,safeClearCharges:p.safeClearCharges-1}));
+    setPlayerPaths({}); ppRef.current={};
+    setCompleted(new Set()); compRef.current=new Set();
+    setActive(null); activeRef.current=null;
+  }
+  function safeReset() {
+    const g=gsRef.current;
+    if (g.safeResetCharges<=0||showNext) return;
+    setGs(p=>({...p,safeResetCharges:p.safeResetCharges-1}));
+    startLevel(g.shapeIdx,g.pairsBase,Date.now()%99999);
+  }
+  function hardReset() {
+    if (showNext) return;
+    const g=gsRef.current; const pz=pzRef.current;
+    const levelWorth = pz ? Math.round((pz.pairsBase??pz.pairs.length)*10*g.multiplier) : 0;
+    const newMult    = Math.max(1.0, Math.round((g.multiplier-0.05)*100)/100);
+    const scoreLoss  = Math.round(levelWorth*0.5);
+    const newShape   = pickShape(g.shapeIdx);
+    setGs(p=>({...p, multiplier:newMult, score:Math.max(0,p.score-scoreLoss), totalMistakes:p.totalMistakes+1, shapeIdx:newShape}));
+    setShaking(true); setDimming(true);
+    setTimeout(()=>setShaking(false),450);
+    setTimeout(()=>{ setDimming(false); startLevel(newShape,g.pairsBase,Date.now()%99999); },700);
+  }
+  function levelComplete() {
+    const g=gsRef.current; const pz=pzRef.current; if(!pz)return;
+    // Charge bonus: held safe clears +5% each, held safe resets +10% each
+    const chargeBonus   = g.safeClearCharges*0.05 + g.safeResetCharges*0.10;
+    const effectiveMult = g.multiplier + chargeBonus;
+    const scorePairs    = pz.pairsBase ?? pz.pairs.length;
+    const levelWorth    = Math.round(scorePairs*10*effectiveMult);
+    const newMult       = Math.round((g.multiplier+0.01)*100)/100;
+    const newLevels     = g.levelsCompleted+1;
+    // Milestone every 10 levels → +1 safe clear charge (cap 5)
+    const prevMile  = Math.floor(g.levelsCompleted/10);
+    const newMile   = Math.floor(newLevels/10);
+    const crossed   = newMile-prevMile;
+    const newClear  = Math.min(5, g.safeClearCharges+(crossed>0?1:0));
+    // +1 safe reset every 50 levels (cap 2)
+    const prevFifty = Math.floor(g.levelsCompleted/50);
+    const newFifty  = Math.floor(newLevels/50);
+    const newReset  = Math.min(2, g.safeResetCharges+(newFifty-prevFifty));
+    // +1 pair every 5 levels (cap at COLOR_KEYS.length)
+    const prev5     = Math.floor(g.levelsCompleted/5);
+    const new5      = Math.floor(newLevels/5);
+    const gained5   = new5-prev5;
+    const newPairs  = Math.min(COLOR_KEYS.length, g.pairsBase+gained5);
+    // Random new shape every 5 levels too
+    const newShapeIdx = (gained5>0) ? pickShape(g.shapeIdx) : g.shapeIdx;
+    const newScore  = g.score+levelWorth;
+    // Build bonus lines for the complete overlay (shown inline, not as popup)
+    const bonusLines = [];
+    if (chargeBonus>0) bonusLines.push(`+${Math.round(chargeBonus*100)}% CHARGE BONUS`);
+    if (gained5>0 && newPairs>g.pairsBase) bonusLines.push(`+${newPairs-g.pairsBase} PAIR${newPairs-g.pairsBase>1?'S':''} UNLOCKED`);
+    if (crossed>0) bonusLines.push(`${newMile*10} LEVEL MILESTONE`);
+    setLevelBonus({pts:levelWorth, charge:bonusLines});
+    setGs(p=>({...p, multiplier:newMult, score:newScore, highScore:Math.max(p.highScore,newScore),
+      levelsCompleted:newLevels, totalPairs:p.totalPairs+pz.pairs.length,
+      safeClearCharges:newClear, safeResetCharges:newReset, pairsBase:newPairs, shapeIdx:newShapeIdx}));
+    setShowNext(true);
+  }
+
+  // ── CANVAS RENDER ────────────────────────────────────────────
+  useEffect(()=>{
+    const canvas=canvasRef.current;
+    if (!canvas||screen!=="game"||!puzzle||loading) return;
+    const ctx=canvas.getContext("2d");
+    const W=cSize;
+    ctx.clearRect(0,0,W,W);
+
+    const { pairs, graph } = puzzle;
+    const { nodes, edges } = graph;
+    const nodeMap={};
+    nodes.forEach(n=>nodeMap[n.id]=n);
+
+    // Background
+    const bg=ctx.createRadialGradient(W/2,W/2,0,W/2,W/2,W*.72);
+    bg.addColorStop(0,"#090012"); bg.addColorStop(1,"#000003");
+    ctx.fillStyle=bg; ctx.fillRect(0,0,W,W);
+
+    // All graph edges — faint skeleton
+    edges.forEach(e=>{
+      const na=nodeMap[e.a], nb=nodeMap[e.b];
+      if (!na||!nb) return;
+      strokeEdge(ctx, na, nb, e.type, W, null, 1, 1.0);
+    });
+
+    // Committed locked player paths
+    Object.entries(playerPaths).forEach(([color,pp])=>{
+      if (!pp.locked) return;
+      pp.edgeSet.forEach(eid=>{
+        const e=edges.find(ed=>ed.id===eid); if(!e)return;
+        strokeEdge(ctx,nodeMap[e.a],nodeMap[e.b],e.type,W,color,1,5);
+      });
+    });
+
+    // Active in-progress path
+    const act=activeRef.current;
+    if (act?.edgeTrail?.length>0) {
+      act.edgeTrail.forEach(eid=>{
+        const e=edges.find(ed=>ed.id===eid); if(!e)return;
+        strokeEdge(ctx,nodeMap[e.a],nodeMap[e.b],e.type,W,act.color,0.72,5);
+      });
+    }
+
+    // Graph intersection nodes (non-endpoint)
+    const endIds=new Set(pairs.flatMap(p=>[p.a,p.b]));
+    nodes.forEach(n=>{
+      if (endIds.has(n.id)) return;
+      const pos=nToC([n.x,n.y],W);
+      ctx.save();
+      ctx.beginPath(); ctx.arc(pos.x,pos.y,2,0,Math.PI*2);
+      ctx.fillStyle="rgba(255,140,100,0.2)"; ctx.fill();
+      ctx.restore();
+    });
+
+    // Endpoint spheres
+    const sr=Math.max(11,W*0.03);
+    pairs.forEach(pair=>{
+      [pair.a,pair.b].forEach(nid=>{
+        const n=nodeMap[nid]; if(!n)return;
+        const pos=nToC([n.x,n.y],W);
+        drawSphere(ctx,pos,pair.color,completed.has(pair.color),dimming,sr);
+      });
+    });
+
+  },[screen,puzzle,loading,playerPaths,active,completed,dimming,cSize]);
+
+  // ── INPUT HELPERS ─────────────────────────────────────────────
+  function evtXY(e) {
+    const rect=canvasRef.current?.getBoundingClientRect();
+    if (!rect) return {x:0,y:0};
+    const s=e.touches?.[0]??e;
+    return {x:s.clientX-rect.left, y:s.clientY-rect.top};
+  }
+
+  // Find the nearest endpoint sphere within snap radius
+  function nearestEndpoint(px,py) {
+    const pz=pzRef.current; if(!pz)return null;
+    const R=Math.max(24,cSize*.07);
+    let best=null,bd=R;
+    for (const pair of pz.pairs) {
+      for (const nid of [pair.a,pair.b]) {
+        const n=pz.graph.nodes.find(n=>n.id===nid); if(!n)continue;
+        const pos=nToC([n.x,n.y],cSize);
+        const d=Math.hypot(px-pos.x,py-pos.y);
+        if (d<bd) { bd=d; best={pair,nid}; }
+      }
+    }
+    return best;
+  }
+
+  // Find nearest node among a given id list within snap radius
+  function nearestAmong(px,py,ids) {
+    const pz=pzRef.current; if(!pz)return null;
+    const R=Math.max(20,cSize*.055);
+    let best=null,bd=R;
+    for (const nid of ids) {
+      const n=pz.graph.nodes.find(n=>n.id===nid); if(!n)continue;
+      const pos=nToC([n.x,n.y],cSize);
+      const d=Math.hypot(px-pos.x,py-pos.y);
+      if (d<bd) { bd=d; best=nid; }
+    }
+    return best;
+  }
+
+  // All nodes/edges occupied by OTHER locked colours.
+  // Endpoints of unlocked colours are NOT blocked — the player must be able
+  // to route through the graph freely; only completed lines are walls.
+  function getOccupiedByOthers(myColor) {
+    const occ={nodes:new Set(),edges:new Set()};
+    Object.entries(ppRef.current).forEach(([col,pp])=>{
+      if (col===myColor||!pp.locked) return;
+      pp.nodeSet.forEach(n=>occ.nodes.add(n));
+      pp.edgeSet.forEach(e=>occ.edges.add(e));
+    });
+    return occ;
+  }
+
+  // ── POINTER DOWN — start drawing ──────────────────────────────
+  const onDown = useCallback(e=>{
+    e.preventDefault();
+    if (showNextRef.current) return;
+    const {x,y}=evtXY(e);
+    const hit=nearestEndpoint(x,y); if(!hit)return;
+    const {pair,nid}=hit;
+    const targetId=pair.a===nid?pair.b:pair.a;
+
+    // Don't allow re-drawing a locked color — once connected, stay connected
+    const pp=ppRef.current[pair.color];
+    if (pp&&pp.locked) return;
+
+    const act={color:pair.color,nodeTrail:[nid],edgeTrail:[],startId:nid,targetId};
+    setActive(act); activeRef.current=act;
+  },[cSize]);
+
+  // ── POINTER MOVE — extend/backtrack drawing ───────────────────
+  const onMove = useCallback(e=>{
+    e.preventDefault();
+    const act=activeRef.current; if(!act)return;
+    const {x,y}=evtXY(e);
+    const pz=pzRef.current; if(!pz)return;
+    const {adj}=pz.graph;
+
+    const curId=act.nodeTrail[act.nodeTrail.length-1];
+    // Only consider nodes adjacent to current node
+    const adjIds=adj[curId].map(a=>a.node);
+    const nextId=nearestAmong(x,y,adjIds);
+    if (nextId==null||nextId===curId) return;
+
+    // ── BACKTRACK: dragged back to previous node ──────────────
+    const prevIdx=act.nodeTrail.indexOf(nextId);
+    if (prevIdx>=0) {
+      if (prevIdx===act.nodeTrail.length-2) {
+        // One step back — release last node and edge
+        const newNodeTrail=act.nodeTrail.slice(0,-1);
+        const newEdgeTrail=act.edgeTrail.slice(0,-1);
+        const updated={...act,nodeTrail:newNodeTrail,edgeTrail:newEdgeTrail};
+        setActive(updated); activeRef.current=updated;
+      }
+      return; // deeper revisit = ignore
+    }
+
+    // ── FORWARD: move to new node ─────────────────────────────
+    const conn=adj[curId].find(a=>a.node===nextId); if(!conn)return;
+
+    // Block: nodes/edges used by other locked colour paths
+    const occ=getOccupiedByOthers(act.color);
+    if (occ.edges.has(conn.edge)) return;
+    if (occ.nodes.has(nextId) && nextId!==act.targetId) return;
+
+    // Block: endpoints belonging to OTHER colours (can't route through another dot)
+    if (pz && nextId!==act.targetId && nextId!==act.startId) {
+      const isOtherEndpoint = pz.pairs.some(p=>
+        p.color!==act.color && (p.a===nextId||p.b===nextId)
+      );
+      if (isOtherEndpoint) return;
+    }
+
+    const newNodeTrail=[...act.nodeTrail,nextId];
+    const newEdgeTrail=[...act.edgeTrail,conn.edge];
+
+    // ── COMPLETE: reached the target endpoint ─────────────────
+    if (nextId===act.targetId) {
+      const nodeSet=new Set(newNodeTrail);
+      const edgeSet=new Set(newEdgeTrail);
+      const locked={nodeSet,edgeSet,locked:true};
+
+      // Commit to state
+      justCompletedRef.current=true;
+      const newPP={...ppRef.current,[act.color]:locked};
+      ppRef.current=newPP;
+      setPlayerPaths(newPP);
+      setActive(null); activeRef.current=null;
+
+      const newComp=new Set([...compRef.current,act.color]);
+      compRef.current=newComp;
+      setCompleted(newComp);
+
+      const pz2=pzRef.current;
+      if (pz2 && newComp.size===pz2.pairs.length) levelComplete();
+      return;
+    }
+
+    const updated={...act,nodeTrail:newNodeTrail,edgeTrail:newEdgeTrail};
+    setActive(updated); activeRef.current=updated;
+  },[cSize]);
+
+  // ── POINTER UP — cancel incomplete line ───────────────────────
+  const onUp = useCallback(e=>{
+    e.preventDefault();
+    if (justCompletedRef.current) { justCompletedRef.current=false; return; }
+    setActive(null); activeRef.current=null;
+  },[]);
+
+  // ── DERIVED UI STATE ──────────────────────────────────────────
+  const multPct    = Math.round((gs.multiplier-1)*100);
+  const nextMile   = (Math.floor(multPct/10)+1)*10;
+  const barPct     = (multPct%10)*10;
+  const pairsTotal = puzzle?.pairs?.length ?? 0;
+  const shapeLabel = SHAPES[gs.shapeIdx%SHAPES.length].label;
+
+  // ══ MENU ════════════════════════════════════════════════════
+  if (screen==="menu") return (
+    <div style={{minHeight:"100vh",background:"#000",display:"flex",flexDirection:"column",alignItems:"center",padding:"22px 16px 36px",overflowY:"auto"}}>
+      <style>{CSS}</style>
+      <div style={{position:"fixed",top:"-28%",left:"-18%",width:"75vw",height:"75vw",borderRadius:"50%",background:"radial-gradient(circle,rgba(255,140,100,.04),transparent 65%)",pointerEvents:"none"}}/>
+      <div style={{position:"fixed",bottom:"-22%",right:"-14%",width:"62vw",height:"62vw",borderRadius:"50%",background:"radial-gradient(circle,rgba(187,134,252,.025),transparent 65%)",pointerEvents:"none"}}/>
+
+      <div style={{textAlign:"center",marginBottom:18,animation:"fadeUp .5s ease"}}>
+        <div className="RJ" style={{color:"rgba(255,140,100,.16)",fontSize:8,letterSpacing:10,marginBottom:5}}>GIRL PUNK PUZZLE</div>
+        <h1 className="TT" style={{fontSize:58,letterSpacing:4,lineHeight:.92,background:"linear-gradient(155deg,#FF8C69,#fff 42%,#FF8C69)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>SPHERE<br/>CONNECT</h1>
+        <div style={{width:50,height:1,background:"linear-gradient(90deg,transparent,#FF8C69,transparent)",margin:"9px auto"}}/>
+        <div className="RJ" style={{color:"rgba(255,140,100,.14)",fontSize:8,letterSpacing:7}}>trace · connect · conquer</div>
+      </div>
+
+      <div style={{background:"#060010",border:"1px solid rgba(255,140,100,.1)",borderRadius:6,padding:"10px 28px",marginBottom:16,textAlign:"center",minWidth:210}}>
+        <div className="RJ" style={{color:"rgba(255,140,100,.22)",fontSize:7,letterSpacing:5,marginBottom:1}}>HIGH SCORE</div>
+        <div className="TT" style={{fontSize:44,color:"#FF8C69",letterSpacing:2}}>{gs.highScore.toLocaleString()}</div>
+        <div style={{display:"flex",gap:20,justifyContent:"center",marginTop:5}}>
+          {[{l:"LEVELS",v:gs.levelsCompleted},{l:"BONUS",v:multPct+"%"},{l:"MISTAKES",v:gs.totalMistakes}].map(s=>(
+            <div key={s.l} style={{textAlign:"center"}}>
+              <div className="RJ" style={{color:"rgba(255,140,100,.16)",fontSize:7,letterSpacing:3}}>{s.l}</div>
+              <div className="TT" style={{color:"#666",fontSize:17}}>{s.v}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={{display:"flex",gap:6,marginBottom:16,flexWrap:"wrap",justifyContent:"center"}}>
+        {[
+          {l:"SAFE CLEAR",v:`${gs.safeClearCharges}/5`,c:"#FF8C69"},
+          {l:"SAFE RESET",v:`${gs.safeResetCharges}/2`,c:"#BB86FC"},
+          {l:"NEXT PAIRS",v:gs.pairsBase,c:"#FFD93D"},
+          {l:"NEXT SHAPE",v:shapeLabel,c:"#4ECDC4"},
+        ].map(r=>(
+          <div key={r.l} style={{background:"#060010",border:"1px solid #0e0e1a",borderRadius:5,padding:"7px 10px",textAlign:"center",minWidth:62}}>
+            <div className="RJ" style={{color:"rgba(255,140,100,.18)",fontSize:6,letterSpacing:3}}>{r.l}</div>
+            <div className="TT" style={{color:r.c,fontSize:16}}>{r.v}</div>
+          </div>
+        ))}
+      </div>
+
+      <button className="btn btn-pink" style={{fontSize:18,padding:"13px 46px",marginBottom:10,letterSpacing:5}} onClick={beginPlay}>PLAY</button>
+      {confirmReset
+        ? <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <span className="RJ" style={{color:"rgba(255,140,100,.5)",fontSize:11,letterSpacing:2}}>ARE YOU SURE?</span>
+            <button className="btn btn-ghost" style={{borderColor:"rgba(255,60,60,.4)",color:"rgba(255,80,80,.65)"}} onClick={()=>{setGs(blankSave());wrSave(blankSave());setConfirmReset(false);}}>YES</button>
+            <button className="btn btn-ghost" onClick={()=>setConfirmReset(false)}>NO</button>
+          </div>
+        : <button className="btn btn-ghost" onClick={()=>setConfirmReset(true)}>RESET PROGRESS</button>
+      }
+
+      <div style={{maxWidth:290,marginTop:18,background:"#040008",border:"1px solid rgba(255,140,100,.07)",borderRadius:6,padding:12}}>
+        <div className="RJ" style={{color:"rgba(255,140,100,.18)",fontSize:7,letterSpacing:5,marginBottom:7}}>HOW TO PLAY</div>
+        <div className="RJ" style={{color:"#252525",fontSize:12,lineHeight:2}}>
+          Drag along the graph to connect matching spheres. Paths <em style={{color:"rgba(255,140,100,.45)"}}>cannot cross or share nodes</em>. Lift your finger to cancel a line with no penalty. Use <em style={{color:"rgba(255,140,100,.45)"}}>Safe Clear</em> to erase all lines, or <em style={{color:"rgba(187,134,252,.45)"}}>Safe Reset</em> for a new layout. <em style={{color:"rgba(255,70,70,.35)"}}>Reset</em> costs score and multiplier.
+        </div>
+      </div>
+
+      <div style={{display:"flex",gap:6,marginTop:18,opacity:.1}}>
+        {Object.values(PAL).map((c,i)=><div key={i} style={{width:7,height:7,borderRadius:"50%",background:c.fill}}/>)}
+      </div>
+    </div>
+  );
+
+  // ══ GAME ════════════════════════════════════════════════════
+  return (
+    <div style={{minHeight:"100vh",background:"#000",display:"flex",flexDirection:"column",alignItems:"center",padding:"7px 12px 14px",userSelect:"none",position:"relative",overflow:"hidden"}}>
+      <style>{CSS}</style>
+
+      {/* Top bar */}
+      <div style={{width:"100%",maxWidth:500,display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:5}}>
+        <button className="btn btn-ghost" style={{padding:"5px 9px",fontSize:9}} onClick={()=>setScreen("menu")}>← MENU</button>
+        <div style={{textAlign:"center"}}>
+          <div className="TT" style={{color:"#FF8C69",fontSize:12,letterSpacing:4,lineHeight:1}}>COLOR PATH</div>
+          <div className="RJ" style={{color:"#0e0e0e",fontSize:8,letterSpacing:3}}>{puzzle?.graph?.shape?.toUpperCase()||"..."} · {pairsTotal} PAIRS</div>
+        </div>
+        <div className="TT" style={{color:"#FF8C69",fontSize:16,minWidth:60,textAlign:"right"}}>{gs.score.toLocaleString()}</div>
+      </div>
+
+      {/* Multiplier bar */}
+      <div style={{width:"100%",maxWidth:500,marginBottom:5}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:2}}>
+          <span className="RJ" style={{color:"#111",fontSize:8,letterSpacing:3}}>MULTIPLIER</span>
+          <span className="TT" style={{color:"#FF8C69",fontSize:13}}>{gs.multiplier.toFixed(2)}×<span className="RJ" style={{color:"#1a1a1a",fontSize:9,marginLeft:4}}>→{nextMile}%</span></span>
+        </div>
+        <div style={{height:2,background:"#080010",borderRadius:2,overflow:"hidden"}}>
+          <div style={{height:"100%",width:`${barPct}%`,background:"linear-gradient(90deg,#FF8C69,#BB86FC)",transition:"width .5s",borderRadius:2}}/>
+        </div>
+      </div>
+
+      {/* Pair dot strip */}
+      {puzzle&&(
+        <div style={{display:"flex",gap:5,marginBottom:6,flexWrap:"wrap",justifyContent:"center"}}>
+          {puzzle.pairs.map(pair=>{
+            const done=completed.has(pair.color);
+            const c=PAL[pair.color];
+            return <div key={pair.color} style={{width:10,height:10,borderRadius:"50%",
+              background:done?c.fill:c.dim,transition:"all .3s",
+              boxShadow:done?`0 0 7px ${c.fill}`:undefined,
+              border:`1px solid ${done?c.fill+"44":"#0e0e0e"}`}}/>;
+          })}
+        </div>
+      )}
+
+      {/* Canvas */}
+      <div className={shaking?"shake":""} style={{borderRadius:14,overflow:"hidden",
+        border:"1px solid #0a0014",boxShadow:"0 0 50px rgba(255,140,100,.04),inset 0 0 40px rgba(0,0,0,.9)",
+        width:cSize,height:cSize,flexShrink:0,position:"relative"}}>
+
+        {loading?(
+          <div style={{width:cSize,height:cSize,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",background:"#040008"}}>
+            <div className="TT" style={{color:"rgba(255,140,100,.25)",fontSize:12,letterSpacing:5,marginBottom:10}}>GENERATING</div>
+            <div style={{display:"flex",gap:7}}>
+              {[0,1,2].map(i=><div key={i} style={{width:8,height:8,borderRadius:"50%",background:"#FF8C69",animation:`pulse .9s ${i*.18}s infinite`}}/>)}
+            </div>
+          </div>
+        ):(
+          <canvas ref={canvasRef} width={cSize} height={cSize}
+            style={{display:"block",touchAction:"none"}}
+            onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
+            onTouchStart={onDown} onTouchMove={onMove} onTouchEnd={onUp}
+          />
+        )}
+
+      </div>
+
+      {/* Completion popup — floats over the canvas edge, no overlay, level stays visible */}
+      {showNext&&(
+        <div style={{position:"relative",width:"100%",maxWidth:cSize,height:0,overflow:"visible",zIndex:10,pointerEvents:"none"}}>
+          <div style={{position:"absolute",bottom:8,left:0,right:0,display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+            <div className="TT" style={{fontSize:36,color:"#FF8C69",letterSpacing:5,textShadow:"0 0 24px #FF8C6940",animation:"fadeUpOut 2.2s ease forwards"}}>COMPLETE</div>
+            <div className="RJ" style={{color:"rgba(255,140,100,.85)",fontSize:13,letterSpacing:4,animation:"fadeUpOut 2.2s .1s ease forwards"}}>+{levelBonus.pts} PTS</div>
+            {(levelBonus.charge||[]).map((line,i)=>(
+              <div key={i} className="RJ" style={{color:"rgba(255,190,130,.6)",fontSize:10,letterSpacing:3,animation:`fadeUpOut 2.2s ${.18+i*.1}s ease forwards`}}>{line}</div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Controls */}
+      <div style={{display:"flex",gap:6,marginTop:7,flexWrap:"wrap",justifyContent:"center"}}>
+        <button className={`cbtn${gs.safeClearCharges>0?" on":""}`}
+          onClick={safeClear} disabled={gs.safeClearCharges<=0||showNext}>
+          CLEAR ×{gs.safeClearCharges}
+        </button>
+        <button className={`cbtn pu${gs.safeResetCharges>0?" on":""}`}
+          onClick={safeReset} disabled={gs.safeResetCharges<=0||showNext}>
+          SAFE RESET ×{gs.safeResetCharges}
+        </button>
+        <button className="cbtn re" onClick={hardReset} disabled={showNext}>RESET ☠</button>
+      </div>
+
+      {/* NEXT button — below safe buttons, fades in after popup */}
+      {showNext&&(
+        <button className="btn btn-pink" style={{marginTop:8,fontSize:14,padding:"10px 36px",letterSpacing:4,animation:"fadeUp .35s .3s ease both"}} onClick={nextLevel}>NEXT →</button>
+      )}
+
+      {puzzle&&!showNext&&(
+        <div className="RJ" style={{color:"#101010",fontSize:9,letterSpacing:3,marginTop:5,textAlign:"center"}}>
+          {(()=>{
+            const cb=gs.safeClearCharges*0.05+gs.safeResetCharges*0.10;
+            const em=gs.multiplier+cb;
+            const sp=puzzle?.pairsBase??pairsTotal;
+            return <>WORTH <span style={{color:"rgba(255,140,100,.18)"}}>{Math.round(sp*10*em)}</span> PTS AT {em.toFixed(2)}×{cb>0&&<span style={{color:"rgba(255,200,80,.25)"}}> (+{Math.round(cb*100)}% CHARGE)</span>}{pairsTotal<sp&&<span style={{color:"rgba(180,180,180,.2)"}}> ({pairsTotal}/{sp} PAIRS)</span>}</>;
+          })()}
+        </div>
+      )}
+    </div>
+  );
+}
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+  </script>
+</body>
+</html>
