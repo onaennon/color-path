@@ -14,8 +14,9 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.3/babel.min.js"></script>
-  <script type="text/babel">
+
+  <!-- Pure JS: game logic, no JSX — runs natively, no Babel needed -->
+  <script>
     const { useState, useRef, useEffect, useCallback } = React;
 
 /* ══════════════════════════════════════════════════════════════
@@ -217,9 +218,10 @@ function gridKey(r, c, cols) { return r * cols + c; }
 function isConnected(active, cols, rows, sixWay) {
   const key = (r,c) => gridKey(r,c,cols);
   let sr=-1, sc=-1;
-  outer: for(let r=0;r<rows;r++) for(let c=0;c<cols;c++){
-    if(active[key(r,c)]){ sr=r; sc=c; break outer; }
-  }
+  const allRC = [];
+  for(let r=0;r<rows;r++) for(let c=0;c<cols;c++) allRC.push([r,c]);
+  const firstActive = allRC.find(([r,c]) => active[key(r,c)]);
+  if(firstActive){ sr=firstActive[0]; sc=firstActive[1]; }
   if(sr<0) return true;
   const vis=new Set(); const stk=[[sr,sc]];
   while(stk.length){
@@ -479,9 +481,10 @@ function makeHoneycombGrid(rng) {
   // Use 6-way hex connectivity for carve validation
   function hexIsConn(act) {
     let sr=-1,sc=-1;
-    outer: for(let r=0;r<H_ROWS;r++) for(let c=0;c<H_COLS;c++){
-      if(act[key(r,c)]){sr=r;sc=c;break outer;}
-    }
+    const allRC2 = [];
+    for(let r=0;r<H_ROWS;r++) for(let c=0;c<H_COLS;c++) allRC2.push([r,c]);
+    const firstActive2 = allRC2.find(([r,c]) => act[key(r,c)]);
+    if(firstActive2){ sr=firstActive2[0]; sc=firstActive2[1]; }
     if(sr<0) return true;
     const vis=new Set(); const stk=[[sr,sc]];
     while(stk.length){
@@ -1080,6 +1083,12 @@ input:checked+.toggle-slider:before{transform:translateX(20px);background:#fff;}
 `;
 
 // ══════════════════════════════════════════════════════════════
+
+  </script>
+
+  <!-- Babel only for the JSX component (~32KB instead of 78KB) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.3/babel.min.js"></script>
+  <script type="text/babel" data-presets="react">
 function App() {
   const [gs,         setGs]         = useState(rdSave);
   const [lang,       setLang]       = useState(()=>{ try{return localStorage.getItem("cp_lang")||"en";}catch{return "en";} });
@@ -1165,7 +1174,7 @@ function App() {
     setActive(null); activeRef.current=null;
     setShaking(false); setShowNext(false); setDimming(false);
     setLevelBonus({pts:0,charge:[]}); stopTimer();
-    const newSeed = puzzleSeed ?? ((Date.now()^(shapeSeed*31))%999983)||1;
+    const newSeed = puzzleSeed != null ? puzzleSeed : (((Date.now()^(shapeSeed*31))%999983)||1);
     setLevelSeed(newSeed);
     setTimeout(()=>{
       const graph = SHAPES[0].build(shapeSeed);
